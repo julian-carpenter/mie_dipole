@@ -191,15 +191,19 @@ class TdseMie(object):
         return int(sum(self.time_in_au < au))
 
     def index_to_fs(self, ii):
+        ii = np.array(ii)
         return self.time_in_au[ii] * self.au_time * 1e15
 
     def index_to_au(self, ii):
+        ii = np.array(ii)
         return self.time_in_au[ii]
 
     def calc_harmonic(self, n):
+        n = np.array(n)
         return self.h * self.c / (self.lam * 1e-9 / n) / self.eV
 
     def ev_to_nm(self, ev):
+        ev = np.array(ev)
         return self.h * self.c / ev / self.eV * 1e9
 
     def radial_profiles(self, x, r, n=None, ev=None):
@@ -209,31 +213,31 @@ class TdseMie(object):
         :param r: The radius of the droplet
         :param n: The harmonic with which we probe
         :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
-        :return:
+        :return: Matplotlib figure
         """
         if ev is None:
             assert n is not None
-            harm_n = self.calc_harmonic(n)
+            energy_ev = self.calc_harmonic(n)
         else:
-            harm_n = ev
+            energy_ev = ev
 
-        harm_n_nm = self.ev_to_nm(harm_n)
+        energy_nm = self.ev_to_nm(energy_ev)
         mu = np.cos(x * np.pi / 180)
         scaling_factor = 2.1792037974346345  # make it comparable to Metzler
 
-        idx_n = sum(self.e_ev < harm_n)
+        idx_n = sum(self.e_ev < energy_ev)
 
         m_ = (self.n_interp.real[0][idx_n] - 1j * self.n_interp.imag[0][idx_n])
-        size_param = (2 * np.pi * r) / harm_n_nm
+        size_param = (2 * np.pi * r) / energy_nm
         y1 = mp.i_per(m_, size_param, mu) * scaling_factor
 
         m_ = (self.n_interp.real[-1][idx_n] - 1j * self.n_interp.imag[-1][idx_n])
-        size_param = (2 * np.pi * r) / harm_n_nm
+        size_param = (2 * np.pi * r) / energy_nm
         y2 = mp.i_per(m_, size_param, mu)
         lbl1 = r"Radial profile | Droplet Radius {} nm | " \
-               r"Probing with: {:02.02f} eV | IR: 0 $W/cm^2$".format(r, harm_n)
+               r"Probing with: {:02.02f} eV | IR: 0 $W/cm^2$".format(r, energy_ev)
         lbl2 = r"Radial profile | Droplet Radius {} nm | " \
-               r"Probing with: {:02.02f} eV | IR: {:02.02e} $W/cm^2$".format(r, harm_n,
+               r"Probing with: {:02.02f} eV | IR: {:02.02e} $W/cm^2$".format(r, energy_ev,
                                                                              self.i_w_cm_2[
                                                                                  -1])
         if n is not None:
@@ -249,6 +253,7 @@ class TdseMie(object):
                     np.sum(y2) / np.sum(y1)))
             ax_rp.legend()
             f_rp.tight_layout()
+        return f_rp
 
     def plot_dependence_on_energy(self, on, ints=(0, -1), include_ref=False):
         """
@@ -285,6 +290,70 @@ class TdseMie(object):
             ax.set_xlabel("Energy [eV]")
             ax.legend()
             ax.set_xlim([self.ref_values.e_ev.min(), self.ref_values.e_ev.max()])
+            f.tight_layout()
+        return f
+
+    def plot_dependence_on_intensity(self, on, arg="real", n=(13, 15), ev=None, ints=(0, -1)):
+        """
+        :param on: Can be 'a' (alpha) or 'n' (refractive index). Both are case-insensitive
+        :param arg: Can be 'real', 'imag', 'abs'
+        :param n: The harmonic with which we probe
+        :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
+        :param ints: List of intensity to plot. Default is: (0, -1) .. This is (start, end) idx
+        :return: Matplotlib figure
+        """
+        on = on.lower()
+        arg = arg.lower()
+        assert on in ["a", "n"]
+        assert arg in ["real", "imag", "abs"]
+
+        if arg == "real":
+            arg_fun = np.real
+            if on == "a":
+                lbl = r"$\alpha_1$"
+            else:
+                lbl = r"$\delta$"
+        elif arg == "imag":
+            arg_fun = np.imag
+            if on == "a":
+                lbl = r"$\alpha_2$"
+            else:
+                lbl = r"$\beta$"
+        elif arg == "abs":
+            arg_fun = np.abs
+            if on == "a":
+                lbl = r"|$\alpha$|"
+            else:
+                lbl = "|n|"
+
+        if on == "a":
+            data = self.a_interp[ints[0]:ints[1]] / self.au_p  # in a.u.
+        else:
+            data = self.n_interp[ints[0]:ints[1]]
+
+        with sns.axes_style("whitegrid"):
+            f, ax = plt.subplots(1, 1, figsize=(16, 8))
+
+            if ev is None:
+                assert n is not None
+                energy_ev = self.calc_harmonic(n)
+            else:
+                energy_ev = ev
+
+            for ii, ev_ in enumerate(energy_ev):
+                # Get the idx of the desired energy
+                idx = int(sum(self.interp_grid_ev < ev_))
+                y = np.array([arg_fun(x[idx]) for x in data])
+
+                lbl_ = r"{} | Energy {:02.02f} eV".format(lbl, ev_)
+                if n is not None:
+                    lbl_ += r" | {}th Harmonic".format(n[ii])
+
+                ax.plot(self.i_w_cm_2[ints[0]:ints[1]], y if on == "a" else 1 - y,
+                        label=lbl_,
+                        linewidth=1)
+            ax.set_xlabel(r"Intensity [$W/cm^2$]")
+            ax.legend()
             f.tight_layout()
         return f
 
