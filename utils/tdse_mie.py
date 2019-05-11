@@ -94,11 +94,10 @@ class TdseMie(object):
         on = on.lower()
         assert on in ("a", "d")
         ind_width = self.fs_to_index(width)
+        self.env = self.get_envelope(ind_width, center, sign)
         if on == "a":
-            self.env = self.get_envelope(ind_width, center, sign)
             self.A_in_au *= self.env
         elif on == "d":
-            self.env = self.get_envelope(ind_width, center, sign)
             self.d_in_au *= self.env
 
     def get_alpha(self, low=15, high=30, res=5000, subtract_mean=True):
