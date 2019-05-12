@@ -6,6 +6,7 @@ from scipy.special import expit
 import miepython as mp
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy import integrate
 from utils.ref_literature import REFERENCE
 
 np.seterr(divide='ignore', invalid='ignore')  # there will be some 'divide by 0' warnings
@@ -205,7 +206,7 @@ class TdseMie(object):
         ev = np.array(ev)
         return self.h * self.c / ev / self.eV * 1e9
 
-    def radial_profiles(self, x, r, n=None, ev=None, normalize=False):
+    def radial_profiles(self, x, r, n=None, ev=None, normalize=True):
         """
 
         :param x: The scattering angle of interest (e.g. linspace from 0 to 30) [°]
@@ -237,7 +238,7 @@ class TdseMie(object):
         y2 = mp.i_per(m_, size_param, mu) * scaling_factor
 
         if normalize:
-            norm = y1.max()
+            norm = integrate.trapz(y1, x)
             y1 /= norm
             y2 /= norm
 
