@@ -23,7 +23,7 @@ tdse_mie.apply_envelope(on="d", width=4.42)
 # GET ALPHA
 lo = 15  # lower energy limit in eV
 hi = 30  # upper energy limit in eV
-res = 5000  # number of values to interpolated between 'lo' and 'hi'
+res = 25000  # number of values to interpolated between 'lo' and 'hi'
 tdse_mie.get_alpha(low=lo, high=hi, res=res)
 # GET N
 tdse_mie.get_n()
@@ -46,8 +46,8 @@ tdse_mie.plot_dependence_on_intensity("n", arg="imag")
 
 # PLOT RADIAL PROFILES
 droplet_radius = 300  # in nm
-angle_res = 500
-theta = np.linspace(0, 30, angle_res)
+angle_res = 1000
+theta = np.linspace(0, 45, angle_res)
 tdse_mie.radial_profiles(theta, droplet_radius, 13)
 tdse_mie.radial_profiles(theta, droplet_radius, 15)
 # SHOW IT

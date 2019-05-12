@@ -205,13 +205,15 @@ class TdseMie(object):
         ev = np.array(ev)
         return self.h * self.c / ev / self.eV * 1e9
 
-    def radial_profiles(self, x, r, n=None, ev=None):
+    def radial_profiles(self, x, r, n=None, ev=None, normalize=False):
         """
 
         :param x: The scattering angle of interest (e.g. linspace from 0 to 30) [°]
         :param r: The radius of the droplet
         :param n: The harmonic with which we probe
         :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
+        :param normalize: (Bool) If True the brightest profile is set to peak at 1 and all other profiles
+                          are normalized with the same value.
         :return: Matplotlib figure
         """
         if ev is None:
@@ -232,7 +234,13 @@ class TdseMie(object):
 
         m_ = (self.n_interp.real[-1][idx_n] - 1j * self.n_interp.imag[-1][idx_n])
         size_param = (2 * np.pi * r) / energy_nm
-        y2 = mp.i_per(m_, size_param, mu)
+        y2 = mp.i_per(m_, size_param, mu) * scaling_factor
+
+        if normalize:
+            norm = y1.max()
+            y1 /= norm
+            y2 /= norm
+
         lbl1 = r"Radial profile | Droplet Radius {} nm | " \
                r"Probing with: {:02.02f} eV | IR: 0 $W/cm^2$".format(r, energy_ev)
         lbl2 = r"Radial profile | Droplet Radius {} nm | " \
@@ -247,9 +255,11 @@ class TdseMie(object):
             ax_rp.semilogy(x, y1, label=lbl1, linewidth=1)
             ax_rp.semilogy(x, y2, label=lbl2, linewidth=1)
             ax_rp.set_xlabel("Scattering Angle [°]")
-            ax_rp.set_title(
-                "Radial profiles | Reduced brightness when IR is present: {:.0%}".format(
-                    np.sum(y2) / np.sum(y1)))
+            ttl = "Radial profiles (Orth. pol.) | Change in brightness when IR is present: {:02.02f}%".format(
+                100 * (np.sum(y2) - np.sum(y1)) / np.sum(y1))
+            if normalize:
+                ttl += " | Normalized to 1"
+            ax_rp.set_title(ttl)
             ax_rp.legend()
             f_rp.tight_layout()
         return f_rp
@@ -292,13 +302,20 @@ class TdseMie(object):
             f.tight_layout()
         return f
 
-    def plot_dependence_on_intensity(self, on, arg="real", n=(13, 15), ev=None, ints=(0, -1)):
+    def plot_dependence_on_intensity(self,
+                                     on,
+                                     arg="real",
+                                     n=(13, 15),
+                                     ev=None,
+                                     ints=(0, -1),
+                                     uncertainty=.5):
         """
         :param on: Can be 'a' (alpha) or 'n' (refractive index). Both are case-insensitive
         :param arg: Can be 'real', 'imag', 'abs'
         :param n: The harmonic with which we probe
         :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
         :param ints: List of intensity to plot. Default is: (0, -1) .. This is (start, end) idx
+        :param uncertainty: Energy uncertainty (in eV) ... final output will be averaged across this energy range
         :return: Matplotlib figure
         """
         on = on.lower()
@@ -329,6 +346,7 @@ class TdseMie(object):
             data = self.a_interp[ints[0]:ints[1]] / self.au_p  # in a.u.
         else:
             data = self.n_interp[ints[0]:ints[1]]
+        data = arg_fun(data)
 
         with sns.axes_style("whitegrid"):
             f, ax = plt.subplots(1, 1, figsize=(16, 8))
@@ -342,13 +360,24 @@ class TdseMie(object):
             for ii, ev_ in enumerate(energy_ev):
                 # Get the idx of the desired energy
                 idx = int(sum(self.interp_grid_ev < ev_))
-                y = np.array([arg_fun(x[idx]) for x in data])
+                if uncertainty == 0:
+                    y = np.array([x[idx] for x in data])
+                else:
+                    lo = self.interp_grid_ev.min()
+                    hi = self.interp_grid_ev.max()
+                    res = len(self.interp_grid_ev)
+                    _idx = int(res * (uncertainty / 2) / (np.abs(hi - lo)))
+                    y = np.array([x[idx - _idx:idx + _idx].mean() for x in data])
 
                 lbl_ = r"{} | Energy {:02.02f} eV".format(lbl, ev_)
                 if n is not None:
                     lbl_ += r" | {}th Harmonic".format(n[ii])
+                if uncertainty > 0:
+                    lbl_ += r" | Averaged over $\pm${:01.02f} eV".format(uncertainty / 2)
 
-                ax.plot(self.i_w_cm_2[ints[0]:ints[1]], y if on == "a" else 1 - y,
+                if on == "n" and arg == "real":
+                    y = 1 - y
+                ax.plot(self.i_w_cm_2[ints[0]:ints[1]], y,
                         label=lbl_,
                         linewidth=1)
             ax.set_xlabel(r"Intensity [$W/cm^2$]")
@@ -356,28 +385,48 @@ class TdseMie(object):
             f.tight_layout()
         return f
 
-    def plot_real_imag_scan(self, on, cmap="jet"):
+    def plot_real_imag_scan(self, on, cmap="jet", n=(13, 15), ev=None, uncertainty=.5):
         """
         Highly specific method for plotting the real/imag scans
 
         :param on: Can be 'a' (alpha) or 'n' (refractive index). Both are case-insensitive
         :param cmap: The cmap for both axes
+        :param n: The harmonic we want to draw in the contour plot
+        :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
+        :param uncertainty: Energy uncertainty (in eV) ... final output will be averaged across this energy range
         :return: Matplotlib figure
         """
+        if n is not None or ev is not None:  # only on arg can be not None
+            assert (n is None and ev is not None) or (n is not None and ev is None)
+
+        if n is not None:
+            energy_ev = self.calc_harmonic(n)
+            if isinstance(n, int):
+                n = [n]
+                energy_ev = [energy_ev]
+            lbl = ["{} th Harmonic ({:02.02f} eV)".format(x, y) for x, y in zip(n, energy_ev)]
+        elif ev is not None:
+            energy_ev = ev
+            if isinstance(energy_ev, int):
+                energy_ev = [energy_ev]
+            lbl = ["{:02.02f} eV".format(y) for x, y in energy_ev]
+        else:
+            energy_ev = None
+
         on = on.lower()
         assert on in ["a", "n"]
 
         if on == "a":
             y = self.a_interp / self.au_p  # in a.u.
-            lbl = (r"$\alpha_1$", r"$\alpha_2$")
+            ttl_ = (r"$\alpha_1$", r"$\alpha_2$")
         else:
             y = self.n_interp
-            lbl = (r"$\delta$", r"$\beta$")
-        ttl = r"{} for $\lambda$: {}nm".format("{}/{}".format(lbl[0], lbl[1]), self.lam)
+            ttl_ = (r"$\delta$", r"$\beta$")
+        ttl = r"{} for $\lambda$: {}nm".format("{}/{}".format(ttl_[0], ttl_[1]), self.lam)
 
-        f, ax = plt.subplots(1, 2, figsize=(16, 8.3))
-        ax[0].imshow(y.real if on == "a" else (1 - y.real), cmap=plt.cm.get_cmap(cmap))
-        ax[1].imshow(y.imag, cmap=plt.cm.get_cmap(cmap))
+        f, ax = plt.subplots(1, 2, figsize=(18, 8))
+        real_h = ax[0].imshow(y.real if on == "a" else (1 - y.real), cmap=plt.cm.get_cmap(cmap))
+        imag_h = ax[1].imshow(y.imag, cmap=plt.cm.get_cmap(cmap))
 
         x_ticks = np.arange(int(len(self.interp_grid_ev)))[::int(len(self.interp_grid_ev) / 5)]
         x_tick_labels = self.interp_grid_ev[::int(len(self.interp_grid_ev) / 5)]
@@ -393,8 +442,25 @@ class TdseMie(object):
             ax_.set_xticklabels(["{:02.02f}".format(x) for x in x_tick_labels])
             ax_.set_yticks(y_ticks)
             ax_.set_yticklabels(["{:02.02f}".format(y) for y in y_tick_labels])
-        ax[0].set_title(lbl[0])
-        ax[1].set_title(lbl[1])
+            if energy_ev is not None:
+                ee = [int(sum(self.interp_grid_ev < x)) for x in energy_ev]
+                for i, (e, l) in enumerate(zip(ee, lbl)):
+                    if uncertainty:
+                        lo = self.interp_grid_ev.min()
+                        hi = self.interp_grid_ev.max()
+                        res = len(self.interp_grid_ev)
+                        _idx = int(res * (uncertainty / 2) / (np.abs(hi - lo)))
+                        ax_.axvline(e - _idx, color=sns.color_palette()[i],
+                                    linewidth=1, linestyle="dashed")
+                        ax_.axvline(e + _idx, color=sns.color_palette()[i],
+                                    linewidth=1, linestyle="dashed")
+                    ax_.axvline(e, label=l, color=sns.color_palette()[i],
+                                linewidth=2, linestyle="solid")
+                ax_.legend()
+        ax[0].set_title(ttl_[0])
+        ax[1].set_title(ttl_[1])
         f.suptitle(ttl)
+        f.colorbar(real_h, ax=ax[0], shrink=.75)
+        f.colorbar(imag_h, ax=ax[1], shrink=.75)
         f.tight_layout()
         return f
