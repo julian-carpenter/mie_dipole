@@ -45,10 +45,27 @@ tdse_mie.plot_dependence_on_intensity("n", arg="real")
 tdse_mie.plot_dependence_on_intensity("n", arg="imag")
 
 # PLOT RADIAL PROFILES
-droplet_radius = 300  # in nm
+droplet_radius = 600  # in nm
 angle_res = 1000
-theta = np.linspace(0, 45, angle_res)
-tdse_mie.radial_profiles(theta, droplet_radius, 13)
-tdse_mie.radial_profiles(theta, droplet_radius, 15)
+max_angle = 30
+harm0 = 13
+harm1 = 15
+theta = np.linspace(0, max_angle, angle_res)
+_, rads_13 = tdse_mie.radial_profiles(theta, droplet_radius, harm0)
+_, rads_15 = tdse_mie.radial_profiles(theta, droplet_radius, harm1)
+
+# PLOT SCATTERING IMAGES
+tdse_mie.plot_scat_images(rads_13,
+                          ints=(0, -1),
+                          n=harm0,
+                          max_angle=max_angle,
+                          r=droplet_radius)
+
+tdse_mie.plot_scat_images(rads_15,
+                          ints=(0, -1),
+                          n=harm1,
+                          max_angle=max_angle,
+                          r=droplet_radius)
+
 # SHOW IT
 plt.show()

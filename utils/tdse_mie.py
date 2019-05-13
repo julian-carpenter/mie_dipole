@@ -209,7 +209,51 @@ class TdseMie(object):
         ev = np.array(ev)
         return self.h * self.c / ev / self.eV * 1e9
 
-    def radial_profiles(self, x, r, n=None, ev=None, normalize=True, ir_idx=-1):
+    def get_diffraction(self, rad, return_log=True, angle_res=500):
+
+        xx = np.arange(-angle_res, angle_res)
+        yy = xx.copy()
+        x_grid, y_grid = np.meshgrid(xx, yy)
+        z_grid = np.sqrt(x_grid ** 2 + y_grid ** 2)
+
+        if return_log:
+            x_min = np.nanmin(rad[rad != 0])  # np.min(rad)
+            global_min = np.log(x_min) if x_min > 0 else 0  # np.log(1e-3)  #
+            global_max = np.log(np.max(rad))
+        else:
+            global_min = 1e-2  # np.min(rad)
+            global_max = np.max(rad)
+
+        if return_log:
+            glob_min = np.exp(global_min)
+        else:
+            glob_min = global_min
+
+        z_ = np.ones_like(z_grid) * glob_min
+        for ii in range(z_grid[angle_res, :].shape[0]):
+            try:
+                for kk in range(angle_res):
+                    try:
+                        z_[kk, ii] = rad[np.round(z_grid[kk, ii]).astype(int)]
+                    except IndexError:
+                        pass
+            except IndexError:
+                pass
+        z_[angle_res:, :] = np.flipud(z_[:angle_res, :])
+        if return_log:
+            z_ = self.inf_log(z_, global_min)
+        return np.array(z_), global_max, glob_min
+
+    @staticmethod
+    def inf_log(arr, global_min):
+        mask = (arr <= 0)
+        notmask = ~mask
+        out = arr.copy()
+        out[notmask] = np.log(out[notmask])
+        out[mask] = global_min  # np.log(1e-3)
+        return out
+
+    def radial_profiles(self, x, r, n=None, ev=None, normalize=False, ir_idx=-1):
         """
 
         :param x: The scattering angle of interest (e.g. linspace from 0 to 30) [°]
@@ -267,7 +311,7 @@ class TdseMie(object):
             ax_rp.set_title(ttl)
             ax_rp.legend()
             f_rp.tight_layout()
-        return f_rp
+        return f_rp, (y1, y2)
 
     def plot_dependence_on_energy(self, on, ints=(0, -1), include_ref=False, n=(13, 15), ev=None, uncertainty=.5):
         """
@@ -334,7 +378,7 @@ class TdseMie(object):
             ax.set_xlabel("Energy [eV]")
             ax.set_xlim([self.ref_values.e_ev.min(), self.ref_values.e_ev.max()])
             ax.set_title("Energy dependency of {}/{}".format(*lbl))
-            ax.legend()
+            ax.legend(loc=1)
             f.tight_layout()
         return f
 
@@ -418,7 +462,7 @@ class TdseMie(object):
                         linewidth=1)
             ax.set_xlabel(r"Intensity [$W/cm^2$]")
             ax.set_title("IR intensity dependency of {}".format(lbl))
-            ax.legend()
+            ax.legend(loc=1)
             f.tight_layout()
         return f
 
@@ -501,3 +545,66 @@ class TdseMie(object):
         f.colorbar(imag_h, ax=ax[1], shrink=.75)
         f.tight_layout()
         return f
+
+    def plot_scat_images(self,
+                         rads,
+                         n=None,
+                         ev=None,
+                         ints=(None, None),
+                         use_log=True,
+                         max_angle=None, r=None):
+        """
+
+        :param rads: The Radial profiles
+        :param n: (Optional) The harmonic with which we probe
+        :param ev: (Optional) Alternatively to 'n' you can pass your own energy of interest in eV
+        :param ints: (Optional) IR intensities that correspond to the rad profiles
+        :param use_log: (Optional) (Bool) Plot in log color scale
+        :param max_angle: (Optional) For the title ... Max scattering angle
+        :param r: (Optional) For the title ... Radius of the droplet
+        :return: Matplotlib figure
+        """
+
+        if n is not None:
+            energy_ev = self.calc_harmonic(n)
+        else:
+            energy_ev = ev
+
+        assert len(rads) == 2  # You have to pass exactly two profiles
+        assert len(rads) == len(ints)
+
+        with sns.axes_style("white"):
+            f, ax = plt.subplots(1, 2, figsize=(16, 8.75))
+            img0, global_max, global_min = self.get_diffraction(rads[0], use_log)
+            img1, _, _ = self.get_diffraction(rads[1], use_log)
+
+            ints_ = self.i_w_cm_2[np.array(ints)]
+            for a, img_, i, ra in zip(ax, (img0, img1), ints_, rads):
+                a.imshow(img_, vmin=global_min, vmax=global_max)
+                a.set_xticks([])
+                a.set_yticks([])
+                int_ = ra.sum() / rads[0].sum()
+                ttl = "Brightness: {:.02%}".format(int_)
+                if i is not None:
+                    ttl += r" | IR Intensity: {:02.02e} $W/cm^2$".format(i)
+                if energy_ev is not None:
+                    ttl += " | Probing with: {:02.02f} eV".format(energy_ev)
+                    if n is not None:
+                        ttl += " ({}th harm.)".format(n)
+                a.set_title(ttl)
+            ttl = ""
+            if max_angle is not None:
+                ttl += r"Max scat. angle: {}°".format(max_angle)
+            if r is not None:
+                if max_angle is not None:
+                    ttl += " | "
+                ttl += "Droplet Radius: {} nm".format(r)
+            f.suptitle(ttl)
+            f.tight_layout()
+            f.subplots_adjust(top=0.96,
+                              bottom=0.0,
+                              left=0.012,
+                              right=0.988,
+                              hspace=0.2,
+                              wspace=0.029)
+            return f
