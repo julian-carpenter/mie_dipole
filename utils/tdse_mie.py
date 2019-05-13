@@ -101,7 +101,7 @@ class TdseMie(object):
         elif on == "d":
             self.d_in_au *= self.env
 
-    def get_alpha(self, low=15, high=30, res=5000, subtract_mean=True):
+    def get_alpha(self, low=15, high=30, res=25000, subtract_mean=True):
         """
         Returns complex alpha in au.
         """
@@ -125,6 +125,9 @@ class TdseMie(object):
         Returns complex alpha in au.
         low and high are for the interpolation ... in eV
         """
+        #  Check if alpha has already been calculated
+        if self.alpha is None:
+            self.get_alpha()
 
         def calc_n(a):  # Clausius-Mossotti-Relation
             frac = np.divide(3 * self.nd * a, 3 * self.e0 - self.nd * a)
@@ -206,7 +209,7 @@ class TdseMie(object):
         ev = np.array(ev)
         return self.h * self.c / ev / self.eV * 1e9
 
-    def radial_profiles(self, x, r, n=None, ev=None, normalize=True):
+    def radial_profiles(self, x, r, n=None, ev=None, normalize=True, ir_idx=-1):
         """
 
         :param x: The scattering angle of interest (e.g. linspace from 0 to 30) [°]
@@ -215,6 +218,7 @@ class TdseMie(object):
         :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
         :param normalize: (Bool) If True the brightest profile is set to peak at 1 and all other profiles
                           are normalized with the same value.
+        :param ir_idx: Idx (In Marc's # index) to which the IR=0 profile should be compared (Default = -1)
         :return: Matplotlib figure
         """
         if ev is None:
@@ -233,7 +237,7 @@ class TdseMie(object):
         size_param = (2 * np.pi * r) / energy_nm
         y1 = mp.i_per(m_, size_param, mu) * scaling_factor
 
-        m_ = (self.n_interp.real[-1][idx_n] - 1j * self.n_interp.imag[-1][idx_n])
+        m_ = (self.n_interp.real[ir_idx][idx_n] - 1j * self.n_interp.imag[ir_idx][idx_n])
         size_param = (2 * np.pi * r) / energy_nm
         y2 = mp.i_per(m_, size_param, mu) * scaling_factor
 
@@ -247,7 +251,7 @@ class TdseMie(object):
         lbl2 = r"Radial profile | Droplet Radius {} nm | " \
                r"Probing with: {:02.02f} eV | IR: {:02.02e} $W/cm^2$".format(r, energy_ev,
                                                                              self.i_w_cm_2[
-                                                                                 -1])
+                                                                                 ir_idx])
         if n is not None:
             lbl1 += " | {}th Harmonic".format(n)
             lbl2 += " | {}th Harmonic".format(n)
@@ -259,18 +263,21 @@ class TdseMie(object):
             ttl = "Radial profiles (Orth. pol.) | Change in brightness when IR is present: {:02.02f}%".format(
                 100 * (np.sum(y2) - np.sum(y1)) / np.sum(y1))
             if normalize:
-                ttl += " | Normalized to 1"
+                ttl += " | Normalized using the int. at IR=0"
             ax_rp.set_title(ttl)
             ax_rp.legend()
             f_rp.tight_layout()
         return f_rp
 
-    def plot_dependence_on_energy(self, on, ints=(0, -1), include_ref=False):
+    def plot_dependence_on_energy(self, on, ints=(0, -1), include_ref=False, n=(13, 15), ev=None, uncertainty=.5):
         """
         :param on: Can be 'a' (alpha) or 'n' (refractive index). Both are case-insensitive
         :param ints: List of intensity to plot. Default is: (0, -1)
         :param include_ref: Only valid if 'on=n'. Plot also the ref values from
                     A. Lucas et al., Phys. Rev. B 28(25):2485 (1983)
+        :param n: The harmonic we want to draw in the plot
+        :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
+        :param uncertainty: Energy uncertainty (in eV) ... final output will be averaged across this energy range
         :return: Matplotlib figure
         """
         on = on.lower()
@@ -282,6 +289,23 @@ class TdseMie(object):
         else:
             y = self.n_interp
             lbl = (r"$\delta$", r"$\beta$")
+
+        if n is not None or ev is not None:  # only on arg can be not None
+            assert (n is None and ev is not None) or (n is not None and ev is None)
+
+        if n is not None:
+            energy_ev = self.calc_harmonic(n)
+            if isinstance(n, int):
+                n = [n]
+                energy_ev = [energy_ev]
+            lbl_ = ["{} th Harmonic ({:02.02f} eV)".format(x, y) for x, y in zip(n, energy_ev)]
+        elif ev is not None:
+            energy_ev = ev
+            if isinstance(energy_ev, int):
+                energy_ev = [energy_ev]
+            lbl_ = ["{:02.02f} eV".format(y) for x, y in energy_ev]
+        else:
+            energy_ev = None
 
         with sns.axes_style("whitegrid"):
             f, ax = plt.subplots(1, 1, figsize=(16, 8))
@@ -297,9 +321,20 @@ class TdseMie(object):
                         linestyle='dashed')
                 ax.plot(self.ref_values.e_ev, self.ref_values.beta, label=r"$\beta$ (Literature)", linewidth=1,
                         linestyle='dashed')
+            if energy_ev is not None:
+                for i, (e, l) in enumerate(zip(energy_ev, lbl_)):
+                    if uncertainty:
+                        _idx = uncertainty / 2
+                        ax.axvline(e - _idx, color=sns.color_palette()[i],
+                                   linewidth=.5, linestyle="dashed")
+                        ax.axvline(e + _idx, color=sns.color_palette()[i],
+                                   linewidth=.5, linestyle="dashed")
+                    ax.axvline(e, label=l, color=sns.color_palette()[i],
+                               linewidth=1, linestyle="solid")
             ax.set_xlabel("Energy [eV]")
-            ax.legend()
             ax.set_xlim([self.ref_values.e_ev.min(), self.ref_values.e_ev.max()])
+            ax.set_title("Energy dependency of {}/{}".format(*lbl))
+            ax.legend()
             f.tight_layout()
         return f
 
@@ -382,6 +417,7 @@ class TdseMie(object):
                         label=lbl_,
                         linewidth=1)
             ax.set_xlabel(r"Intensity [$W/cm^2$]")
+            ax.set_title("IR intensity dependency of {}".format(lbl))
             ax.legend()
             f.tight_layout()
         return f
@@ -423,7 +459,7 @@ class TdseMie(object):
         else:
             y = self.n_interp
             ttl_ = (r"$\delta$", r"$\beta$")
-        ttl = r"{} for $\lambda$: {}nm".format("{}/{}".format(ttl_[0], ttl_[1]), self.lam)
+        ttl = r"{} for $\lambda$: {}nm".format("{}/{}".format(*ttl_), self.lam)
 
         f, ax = plt.subplots(1, 2, figsize=(18, 8))
         real_h = ax[0].imshow(y.real if on == "a" else (1 - y.real), cmap=plt.cm.get_cmap(cmap))
