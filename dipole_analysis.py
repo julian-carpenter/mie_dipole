@@ -12,7 +12,7 @@ sns.set_style("white")
 
 # SETTING THE PATHS
 root_ = os.path.abspath(os.path.sep)
-base_dir = os.path.join(root_, "path", "to", "tdse_data")
+file_path = os.path.join(root_, "path", "to", "tdse_data")
 
 # Should the plots be printed out
 printing = True
