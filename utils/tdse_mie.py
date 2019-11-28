@@ -7,7 +7,9 @@ import miepython as mp
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import integrate
-from utils.ref_literature import REFERENCE
+from scipy import signal
+from contextlib import nullcontext
+from utils.ref_literature import REFERENCE, get_turbo
 
 np.seterr(divide='ignore', invalid='ignore')  # there will be some 'divide by 0' warnings
 
@@ -17,7 +19,8 @@ class TdseMie(object):
                  data_path,
                  lam=800,
                  max_int=20,
-                 step_size=6.25e-4):
+                 step_size=6.25e-4,
+                 save_folder="."):
         # CONSTANTS
         self.alpha = None  # Placeholder
         self.n = None  # Placeholder
@@ -35,13 +38,21 @@ class TdseMie(object):
         self.e0 = cs.epsilon_0
         self.eV = cs.physical_constants["electron volt"][0]
         self.au_time = cs.physical_constants["atomic unit of time"][0]
+        self.au_length = cs.physical_constants["atomic unit of length"][0]
+        self.au_epsilon = cs.physical_constants["atomic unit of permittivity"][0]
         self.au_efield = cs.physical_constants["atomic unit of electric field"][0]
+        self.au_edipole = cs.physical_constants["atomic unit of electric dipole mom."][0]
         self.au_p = cs.physical_constants["atomic unit of electric polarizability"][0]
         self.au_pot = cs.physical_constants["atomic unit of electric potential"][0]
+        self.fine_struct = cs.physical_constants["fine-structure constant"][0]
         self.a0 = cs.physical_constants["Bohr radius"][0]
         self.nd = 0.022e30  # number density of liquid helium
         self.ref_res = 250  # the resolution for the interpolation of the reference values
         self.ref_values = REFERENCE(self.ref_res)
+        self.save_folder = save_folder
+
+        if not os.path.isdir(self.save_folder):
+            self.save_folder = "."
 
         # LOAD THE DATA
         self.A_in_au = []
@@ -67,8 +78,8 @@ class TdseMie(object):
         self.i_w_cm_2 = .5 / 1e4 * self.e0 * cs.c * (
                 (self.au_pot / self.a0) * np.arange(pargs[0]) * self.step_size) ** 2
 
-        # Check that A and d has dimensions (max_int, n)
-        # if max_int == 1 we would end up with an array of dim n, since
+        # Check that A and d have dimensions (max_int, n)
+        # if max_int == 1 we would end up with an array of dim n
         # we adding in that case an extra dim.
         self.A_in_au = np.array(self.A_in_au)
         try:
@@ -84,9 +95,9 @@ class TdseMie(object):
             print("{}\n Adding an extra dimension to d".format(e))
             self.d_in_au = np.expand_dims(self.d_in_au, axis=0)
 
-    def apply_envelope(self, on="A", width=10, center="max", sign=-1):
+    def apply_envelope(self, on="A", width=10, center="max", sign=-1, use_hann=True):
         """
-        In place application of a sigmoidal envelope.
+        In place multiplication of a sigmoidal envelope.
         'on' has to be 'A' or 'd' (not case-sensitive).
         'width' is the tau parameter in the sigmoid, given in fs.
         'center' is where the sigmoid should be 1/2 of the
@@ -95,7 +106,7 @@ class TdseMie(object):
         on = on.lower()
         assert on in ("a", "d")
         ind_width = self.fs_to_index(width)
-        self.env = self.get_envelope(ind_width, center, sign)
+        self.env = self.get_envelope(ind_width, center, sign, use_hann)
         if on == "a":
             self.A_in_au *= self.env
         elif on == "d":
@@ -107,12 +118,16 @@ class TdseMie(object):
         """
         if subtract_mean:
             self.d_in_au = np.subtract(self.d_in_au.T, self.d_in_au.mean(axis=1)).T
-        d_au_env_fft = np.fft.ifft(self.d_in_au, axis=1)
+        # The full (two-electron) dipole moment is 2*F[d](w).
+        # See: Gaarde, M. B., Buth, C., Tate, J. L., & Schafer, K. J. (2011).
+        # Transient absorption and reshaping of ultrafast XUV light by laser-dressed helium.
+        # Physical Review A - Atomic, Molecular, and Optical Physics, 83(1).
+        # https://doi.org/10.1103/PhysRevA.83.013419
+        d_au_env_fft = 2 * np.fft.ifft(self.d_in_au, axis=1)
         a_au_env_fft = np.fft.ifft(self.A_in_au, axis=1)
 
         # ALPHA | alpha is d(w) / ( i * dw * A(w) )
-        # self.alpha = 2 * np.divide(d_au_env_fft, (1j * self.dw_au * a_au_env_fft))
-        self.alpha = 2 * np.pi * np.divide(d_au_env_fft, (1j * self.dw_au * a_au_env_fft))
+        self.alpha = np.divide(d_au_env_fft, (1j * self.dw_au * a_au_env_fft))
         # INTERPOLATION
         # alpha
         self.interp_grid_ev = np.linspace(low, high, res)
@@ -133,9 +148,6 @@ class TdseMie(object):
             frac = np.divide(3 * self.nd * a, 3 * self.e0 - self.nd * a)
             return np.sqrt(1 + frac)
 
-        if self.alpha is None:
-            self.get_alpha()
-
         self.n = calc_n(self.a_si)
 
         # FOR THE INTERPOLATED ALPHA
@@ -143,22 +155,30 @@ class TdseMie(object):
 
         return self.n, self.n_interp
 
-    def get_envelope(self, width, center, sign=-1, signal_size=None):
+    def get_envelope(self, width, center, sign=-1, signal_size=None, use_hann=True):
         """
         Construct a sigmoid that serves as an envelope.
         'width' is in 'index' and 'center' can be 'max' or in 'index'.
          Optional: 'signal_size' is the length of the signal.
         """
+
         if center == "max":
-            # c_ = int(18363)  # this was checked manually ... so be careful here
-            c_ = int(18222)  # this is what Thomas & Bjorn use
+            c_ = int(18408)  # this was checked manually ... so be careful here
+            # c_ = int(18222)  # this is what Thomas & Bjorn use
         else:
             c_ = center
         if signal_size is None:
             x = np.arange(self.time_in_au.size)
         else:
             x = np.arange(signal_size)
-        env = [expit(sign * (x - c_) / width)] * self.A_in_au.shape[0]
+
+        if use_hann:
+            env = np.zeros(self.A_in_au.shape[1])
+            env[c_ - width:c_ + width] = signal.hanning(int(2 * width))
+        else:
+            env = expit(sign * (x - c_) / width)
+
+        env = [env] * self.A_in_au.shape[0]
         return np.array(env)
 
     def fs_to_au(self, fs):
@@ -253,7 +273,7 @@ class TdseMie(object):
         out[mask] = global_min  # np.log(1e-3)
         return out
 
-    def radial_profiles(self, x, r, n=None, ev=None, normalize=False, ir_idx=-1):
+    def radial_profiles(self, x, r, n=None, ev=None, normalize=False, ir_idx=-1, printing=False):
         """
 
         :param x: The scattering angle of interest (e.g. linspace from 0 to 30) [°]
@@ -265,25 +285,21 @@ class TdseMie(object):
         :param ir_idx: Idx (In Marc's # index) to which the IR=0 profile should be compared (Default = -1)
         :return: Matplotlib figure
         """
+        if printing:
+            context = plt.rc_context({'font.size': 26,
+                                      "text.usetex": True,
+                                      "text.latex.preamble": r'\usepackage{mathpazo}'})
+        else:
+            context = nullcontext()
+
         if ev is None:
             assert n is not None
             energy_ev = self.calc_harmonic(n)
         else:
             energy_ev = ev
 
-        energy_nm = self.ev_to_nm(energy_ev)
-        mu = np.cos(x * np.pi / 180)
-        scaling_factor = 2.1792037974346345  # make it comparable to Metzler
-
-        idx_n = sum(self.e_ev < energy_ev)
-
-        m_ = (self.n_interp.real[0][idx_n] - 1j * self.n_interp.imag[0][idx_n])
-        size_param = (2 * np.pi * r) / energy_nm
-        y1 = mp.i_per(m_, size_param, mu) * scaling_factor
-
-        m_ = (self.n_interp.real[ir_idx][idx_n] - 1j * self.n_interp.imag[ir_idx][idx_n])
-        size_param = (2 * np.pi * r) / energy_nm
-        y2 = mp.i_per(m_, size_param, mu) * scaling_factor
+        y1 = self.get_single_rad(x, energy_ev, r, 0)
+        y2 = self.get_single_rad(x, energy_ev, r, ir_idx)
 
         if normalize:
             norm = integrate.trapz(y1, x)
@@ -299,21 +315,35 @@ class TdseMie(object):
         if n is not None:
             lbl1 += " | {}th Harmonic".format(n)
             lbl2 += " | {}th Harmonic".format(n)
-        with sns.axes_style("whitegrid"):
-            f_rp, ax_rp = plt.subplots(1, 1, figsize=(16, 8))
+        with sns.axes_style("whitegrid"), context:
+            if printing:
+                f_rp, ax_rp = plt.subplots(1, 1, figsize=(32, 16))
+            else:
+                f_rp, ax_rp = plt.subplots(1, 1, figsize=(16, 8))
+
             ax_rp.semilogy(x, y1, label=lbl1, linewidth=1)
             ax_rp.semilogy(x, y2, label=lbl2, linewidth=1)
             ax_rp.set_xlabel("Scattering Angle [°]")
             ttl = "Radial profiles (Orth. pol.) | Change in brightness when IR is present: {:02.02f}%".format(
-                100 * (np.sum(y2) - np.sum(y1)) / np.sum(y1))
+                100 * np.sum(y2) / np.sum(y1))
             if normalize:
                 ttl += " | Normalized using the int. at IR=0"
             ax_rp.set_title(ttl)
             ax_rp.legend()
             f_rp.tight_layout()
-        return f_rp, (y1, y2)
+            if printing:
+                f_rp.savefig(os.path.join(self.save_folder,
+                                          "{:02.02f}_{}_{:02.02e}_radial_profiles.pdf".format(energy_ev,
+                                                                                              self.lam,
+                                                                                              self.i_w_cm_2[-1])),
+                             dpi=300)
+                plt.close(f_rp)
+            return y1, y2
 
-    def plot_dependence_on_energy(self, on, ints=(0, -1), include_ref=False, n=(13, 15), ev=None, uncertainty=.5):
+    def plot_dependence_on_energy(self, on, ints=(0, -1),
+                                  include_ref=False, n=(13, 15),
+                                  ev=None, uncertainty=.5,
+                                  printing=False):
         """
         :param on: Can be 'a' (alpha) or 'n' (refractive index). Both are case-insensitive
         :param ints: List of intensity to plot. Default is: (0, -1)
@@ -324,6 +354,13 @@ class TdseMie(object):
         :param uncertainty: Energy uncertainty (in eV) ... final output will be averaged across this energy range
         :return: Matplotlib figure
         """
+        if printing:
+            context = plt.rc_context({'font.size': 26,
+                                      "text.usetex": True,
+                                      "text.latex.preamble": r'\usepackage{mathpazo}'})
+        else:
+            context = nullcontext()
+
         on = on.lower()
         assert on in ["a", "n"]
 
@@ -339,6 +376,7 @@ class TdseMie(object):
 
         if n is not None:
             energy_ev = self.calc_harmonic(n)
+
             if isinstance(n, int):
                 n = [n]
                 energy_ev = [energy_ev]
@@ -351,8 +389,12 @@ class TdseMie(object):
         else:
             energy_ev = None
 
-        with sns.axes_style("whitegrid"):
-            f, ax = plt.subplots(1, 1, figsize=(16, 8))
+        with sns.axes_style("whitegrid"), context:
+            if printing:
+                f, ax = plt.subplots(1, 1, figsize=(32, 16))
+            else:
+                f, ax = plt.subplots(1, 1, figsize=(16, 8))
+
             for i_ in ints:
                 ax.plot(self.interp_grid_ev, y[i_].real if on == "a" else (1 - y[i_].real),
                         label=r"{} | IR: {:02.02e} $W/cm^2$".format(lbl[0], self.i_w_cm_2[i_]),
@@ -380,7 +422,15 @@ class TdseMie(object):
             ax.set_title("Energy dependency of {}/{}".format(*lbl))
             ax.legend(loc=1)
             f.tight_layout()
-        return f
+            if printing:
+                f.savefig(os.path.join(self.save_folder,
+                                       "{}_{}_{:02.02e}_dependence_on_energy.pdf".format(on,
+                                                                                         self.lam,
+                                                                                         self.i_w_cm_2[-1])),
+                          dpi=300)
+                plt.close(f)
+            else:
+                return f
 
     def plot_dependence_on_intensity(self,
                                      on,
@@ -388,9 +438,10 @@ class TdseMie(object):
                                      n=(13, 15),
                                      ev=None,
                                      ints=(0, -1),
-                                     uncertainty=.5):
+                                     uncertainty=.5,
+                                     printing=False):
         """
-        :param on: Can be 'a' (alpha) or 'n' (refractive index). Both are case-insensitive
+        :param on: Can be 'a' (alpha), 'n' (refractive index) or 'int' (Brightness on detector) (Case-insensitive)
         :param arg: Can be 'real', 'imag', 'abs'
         :param n: The harmonic with which we probe
         :param ev: Alternatively to 'n' you can pass your own energy of interest in eV
@@ -398,9 +449,16 @@ class TdseMie(object):
         :param uncertainty: Energy uncertainty (in eV) ... final output will be averaged across this energy range
         :return: Matplotlib figure
         """
+        if printing:
+            context = plt.rc_context({'font.size': 26,
+                                      "text.usetex": True,
+                                      "text.latex.preamble": r'\usepackage{mathpazo}'})
+        else:
+            context = nullcontext()
+
         on = on.lower()
         arg = arg.lower()
-        assert on in ["a", "n"]
+        assert on in ["a", "n", "int"]
         assert arg in ["real", "imag", "abs"]
 
         if arg == "real":
@@ -422,20 +480,26 @@ class TdseMie(object):
             else:
                 lbl = "|n|"
 
+        if ev is None:
+            assert n is not None
+            energy_ev = self.calc_harmonic(n)
+        else:
+            energy_ev = ev
+
         if on == "a":
             data = self.a_interp[ints[0]:ints[1]] / self.au_p  # in a.u.
         else:
             data = self.n_interp[ints[0]:ints[1]]
-        data = arg_fun(data)
+        if on == "int":
+            x = 1
+        else:
+            data = arg_fun(data)
 
-        with sns.axes_style("whitegrid"):
-            f, ax = plt.subplots(1, 1, figsize=(16, 8))
-
-            if ev is None:
-                assert n is not None
-                energy_ev = self.calc_harmonic(n)
+        with sns.axes_style("whitegrid"), context:
+            if printing:
+                f, ax = plt.subplots(1, 1, figsize=(32, 16))
             else:
-                energy_ev = ev
+                f, ax = plt.subplots(1, 1, figsize=(16, 8))
 
             for ii, ev_ in enumerate(energy_ev):
                 # Get the idx of the desired energy
@@ -464,9 +528,17 @@ class TdseMie(object):
             ax.set_title("IR intensity dependency of {}".format(lbl))
             ax.legend(loc=1)
             f.tight_layout()
-        return f
+            if printing:
+                f.savefig(os.path.join(self.save_folder,
+                                       "{}_{}_{}_{:02.02e}_dependence_on_intensity.pdf".format(on, arg,
+                                                                                               self.lam,
+                                                                                               self.i_w_cm_2[-1])),
+                          dpi=300)
+                plt.close(f)
+            else:
+                return f
 
-    def plot_real_imag_scan(self, on, cmap="jet", n=(13, 15), ev=None, uncertainty=.5):
+    def plot_real_imag_scan(self, on, cmap="jet", n=(13, 15), ev=None, uncertainty=.5, printing=False):
         """
         Highly specific method for plotting the real/imag scans
 
@@ -477,6 +549,13 @@ class TdseMie(object):
         :param uncertainty: Energy uncertainty (in eV) ... final output will be averaged across this energy range
         :return: Matplotlib figure
         """
+        if printing:
+            context = plt.rc_context({'font.size': 26,
+                                      "text.usetex": True,
+                                      "text.latex.preamble": r'\usepackage{mathpazo}'})
+        else:
+            context = nullcontext()
+
         if n is not None or ev is not None:  # only on arg can be not None
             assert (n is None and ev is not None) or (n is not None and ev is None)
 
@@ -505,46 +584,60 @@ class TdseMie(object):
             ttl_ = (r"$\delta$", r"$\beta$")
         ttl = r"{} for $\lambda$: {}nm".format("{}/{}".format(*ttl_), self.lam)
 
-        f, ax = plt.subplots(1, 2, figsize=(18, 8))
-        real_h = ax[0].imshow(y.real if on == "a" else (1 - y.real), cmap=plt.cm.get_cmap(cmap))
-        imag_h = ax[1].imshow(y.imag, cmap=plt.cm.get_cmap(cmap))
+        with context:
+            if printing:
+                f, ax = plt.subplots(1, 2, figsize=(36, 16))
+            else:
+                f, ax = plt.subplots(1, 2, figsize=(18, 8))
 
-        x_ticks = np.arange(int(len(self.interp_grid_ev)))[::int(len(self.interp_grid_ev) / 5)]
-        x_tick_labels = self.interp_grid_ev[::int(len(self.interp_grid_ev) / 5)]
+            real_h = ax[0].imshow(y.real if on == "a" else (1 - y.real), cmap=plt.cm.get_cmap(cmap))
+            imag_h = ax[1].imshow(y.imag, cmap=plt.cm.get_cmap(cmap))
 
-        y_ticks = np.arange(int(len(self.i_w_cm_2)))[::int(len(self.i_w_cm_2) / 5)]
-        y_tick_labels = self.i_w_cm_2[::int(len(self.i_w_cm_2) / 5)] * 1e-12
+            x_ticks = np.arange(int(len(self.interp_grid_ev)))[::int(len(self.interp_grid_ev) / 5)]
+            x_tick_labels = self.interp_grid_ev[::int(len(self.interp_grid_ev) / 5)]
 
-        for ax_ in ax:
-            ax_.set_aspect(y.shape[1] / y.shape[0])
-            ax_.set_xlabel("Energy [eV]")
-            ax_.set_ylabel(r"Intensity [$W/cm^{2}$] [$\cdot 10^{12}$]")
-            ax_.set_xticks(x_ticks)
-            ax_.set_xticklabels(["{:02.02f}".format(x) for x in x_tick_labels])
-            ax_.set_yticks(y_ticks)
-            ax_.set_yticklabels(["{:02.02f}".format(y) for y in y_tick_labels])
-            if energy_ev is not None:
-                ee = [int(sum(self.interp_grid_ev < x)) for x in energy_ev]
-                for i, (e, l) in enumerate(zip(ee, lbl)):
-                    if uncertainty:
-                        lo = self.interp_grid_ev.min()
-                        hi = self.interp_grid_ev.max()
-                        res = len(self.interp_grid_ev)
-                        _idx = int(res * (uncertainty / 2) / (np.abs(hi - lo)))
-                        ax_.axvline(e - _idx, color=sns.color_palette()[i],
-                                    linewidth=1, linestyle="dashed")
-                        ax_.axvline(e + _idx, color=sns.color_palette()[i],
-                                    linewidth=1, linestyle="dashed")
-                    ax_.axvline(e, label=l, color=sns.color_palette()[i],
-                                linewidth=2, linestyle="solid")
-                ax_.legend()
-        ax[0].set_title(ttl_[0])
-        ax[1].set_title(ttl_[1])
-        f.suptitle(ttl)
-        f.colorbar(real_h, ax=ax[0], shrink=.75)
-        f.colorbar(imag_h, ax=ax[1], shrink=.75)
-        f.tight_layout()
-        return f
+            y_ticks = np.arange(int(len(self.i_w_cm_2)))[::int(len(self.i_w_cm_2) / 5)]
+            y_tick_labels = self.i_w_cm_2[::int(len(self.i_w_cm_2) / 5)] * 1e-12
+
+            for ax_ in ax:
+                ax_.set_aspect(y.shape[1] / y.shape[0])
+                ax_.set_xlabel("Energy [eV]")
+                ax_.set_ylabel(r"Intensity [$W/cm^{2}$] [$\cdot 10^{12}$]")
+                ax_.set_xticks(x_ticks)
+                ax_.set_xticklabels(["{:02.02f}".format(x) for x in x_tick_labels])
+                ax_.set_yticks(y_ticks)
+                ax_.set_yticklabels(["{:02.02f}".format(y) for y in y_tick_labels])
+                if energy_ev is not None:
+                    ee = [int(sum(self.interp_grid_ev < x)) for x in energy_ev]
+                    for i, (e, l) in enumerate(zip(ee, lbl)):
+                        if uncertainty:
+                            lo = self.interp_grid_ev.min()
+                            hi = self.interp_grid_ev.max()
+                            res = len(self.interp_grid_ev)
+                            _idx = int(res * (uncertainty / 2) / (np.abs(hi - lo)))
+                            ax_.axvline(e - _idx, color=sns.color_palette("bright", 8)[2 + i],
+                                        linewidth=1, linestyle="dashed")
+                            ax_.axvline(e + _idx, color=sns.color_palette("bright", 8)[2 + i],
+                                        linewidth=1, linestyle="dashed")
+                        ax_.axvline(e, label=l, color=sns.color_palette("bright", 8)[2 + i],
+                                    linewidth=2, linestyle="solid")
+                    ax_.legend()
+            ax[0].set_title(ttl_[0])
+            ax[1].set_title(ttl_[1])
+            f.suptitle(ttl)
+            f.colorbar(real_h, ax=ax[0], shrink=.75)
+            f.colorbar(imag_h, ax=ax[1], shrink=.75)
+            f.tight_layout()
+
+            if printing:
+                f.savefig(os.path.join(self.save_folder,
+                                       "{}_{}_{:02.02e}_real_imag_scan.pdf".format(on,
+                                                                                   self.lam,
+                                                                                   self.i_w_cm_2[-1])),
+                          dpi=300)
+                plt.close(f)
+            else:
+                return f
 
     def plot_scat_images(self,
                          rads,
@@ -552,7 +645,10 @@ class TdseMie(object):
                          ev=None,
                          ints=(None, None),
                          use_log=True,
-                         max_angle=None, r=None):
+                         max_angle=None,
+                         r=None,
+                         detector_hole=True,
+                         printing=False):
         """
 
         :param rads: The Radial profiles
@@ -562,37 +658,68 @@ class TdseMie(object):
         :param use_log: (Optional) (Bool) Plot in log color scale
         :param max_angle: (Optional) For the title ... Max scattering angle
         :param r: (Optional) For the title ... Radius of the droplet
+        :param detector_hole: (Bool) Simulate a detector hole
         :return: Matplotlib figure
         """
-
+        if printing:
+            context = plt.rc_context({'font.size': 26,
+                                      "text.usetex": True,
+                                      "text.latex.preamble": r'\usepackage{mathpazo}'})
+        else:
+            context = nullcontext()
         if n is not None:
             energy_ev = self.calc_harmonic(n)
         else:
             energy_ev = ev
 
+        if ev is None and n is None:
+            assert energy_ev is None
+
         assert len(rads) == 2  # You have to pass exactly two profiles
         assert len(rads) == len(ints)
+        if detector_hole:
+            rads = np.array(rads)
+            rads[:, :50] = 0  # This corresponds to ~ 3°
 
-        with sns.axes_style("white"):
-            f, ax = plt.subplots(1, 2, figsize=(16, 8.75))
-            img0, global_max, global_min = self.get_diffraction(rads[0], use_log)
-            img1, _, _ = self.get_diffraction(rads[1], use_log)
+        with sns.axes_style("white"), context:
+            if printing:
+                f, ax = plt.subplots(1, 2, figsize=(32, 17.5))
+            else:
+                f, ax = plt.subplots(1, 2, figsize=(16, 8.75))
+
+            img0, ma, mi = self.get_diffraction(rads[0], use_log)
+            img1, ma_2, mi_2 = self.get_diffraction(rads[1], use_log)
+
+            global_max = np.max([ma, ma_2])
+            global_min = np.max([mi, mi_2])
 
             ints_ = self.i_w_cm_2[np.array(ints)]
             for a, img_, i, ra in zip(ax, (img0, img1), ints_, rads):
-                a.imshow(img_, vmin=global_min, vmax=global_max)
+                a.imshow(img_, vmin=mi, vmax=ma)
                 a.set_xticks([])
                 a.set_yticks([])
-                int_ = ra.sum() / rads[0].sum()
-                ttl = "Brightness: {:.02%}".format(int_)
+                if use_log:
+                    int_ = np.exp(img_).sum() / np.exp(img0).sum()
+                else:
+                    int_ = img_.sum() / img0.sum()
+                ttl = "Brightness: {:.02%}%".format(int_)
                 if i is not None:
                     ttl += r" | IR Intensity: {:02.02e} $W/cm^2$".format(i)
                 if energy_ev is not None:
                     ttl += " | Probing with: {:02.02f} eV".format(energy_ev)
                     if n is not None:
                         ttl += " ({}th harm.)".format(n)
+                else:
+                    n = (13, 15)
+                    e_ = []
+                    for n_ in n:
+                        e_.append(self.calc_harmonic(n_))
+                    ttl += " | Probing with (13th {:02.02f} and 15th {:02.02f} harm.)".format(*e_)
+
                 a.set_title(ttl)
-            ttl = ""
+            ttl = "Diffraction pattern ({} cmap)".format("log." if use_log else "linear")
+            if max_angle is not None or r is not None:
+                ttl += " | "
             if max_angle is not None:
                 ttl += r"Max scat. angle: {}°".format(max_angle)
             if r is not None:
@@ -607,4 +734,137 @@ class TdseMie(object):
                               right=0.988,
                               hspace=0.2,
                               wspace=0.029)
-            return f
+            if printing:
+                f.savefig(os.path.join(self.save_folder,
+                                       "{}_{}_{:02.02e}_scat_images.pdf".format(["{:02.02f}".format(x) for x in n],
+                                                                                self.lam,
+                                                                                self.i_w_cm_2[-1])),
+                          dpi=300)
+                plt.close(f)
+            return int_
+
+    def plot_intensity_waterfall(self, on, max_int=20, plot_energy_levels=True,
+                                 min_idx=8000, max_idx=15000, cmap="turbo",
+                                 printing=False):
+        """
+
+        :param max_int:
+        :param plot_energy_levels:
+        :param cmap:
+        :return:
+        """
+        from mpl_toolkits.mplot3d import Axes3D
+        from matplotlib.collections import PolyCollection
+        if printing:
+            context = plt.rc_context({'font.size': 26,
+                                      "text.usetex": True,
+                                      "text.latex.preamble": r'\usepackage{mathpazo}'})
+        else:
+            context = nullcontext()
+
+        if cmap.lower() == "turbo":
+            plt.register_cmap(name='turbo', data=get_turbo(), lut=256)
+
+        if on == "a":
+            y = self.a_interp
+        else:
+            y = self.n_interp
+
+        cmap = plt.cm.get_cmap(cmap)
+        color_picker = np.linspace(0, 255, max_int).astype(int)
+        colors = [cmap(i) for i in color_picker]
+
+        with context:
+            if printing:
+                fig = plt.figure(figsize=(32, 16))
+            else:
+                fig = plt.figure(figsize=(12, 8))
+            ax = fig.gca(projection='3d')
+            if on == "a":
+                # See equation (22) in:
+                # Gaarde, M. B., Buth, C., Tate, J. L., & Schafer, K. J. (2011).
+                # Transient absorption and reshaping of ultrafast XUV light by laser-dressed helium.
+                # Physical Review A - Atomic, Molecular, and Optical Physics, 83(1).
+                ww = 2 * np.pi / self.period * self.t_vec / self.au_time
+                const = 4 * np.pi * ww / (cs.c * cs.epsilon_0)  # / self.fine_struct
+
+            xs = self.interp_grid_ev[min_idx:max_idx]
+            verts = []
+            y_max = 0
+            for ii in range(max_int):
+                if on == "a":
+                    ys = const[ii] * y[ii][min_idx:max_idx].imag * 1e22
+                else:
+                    ys = y[ii][min_idx:max_idx].imag
+                if ys.max() > y_max:
+                    y_max = ys.max()
+                ys[ys < 0] = 0
+                ys[0], ys[-1] = (0, 0)
+                verts.append(list(zip(xs, ys)))
+            poly = PolyCollection(verts, facecolor=colors)
+
+            poly.set_alpha(1)
+            ax.add_collection3d(poly, zs=np.linspace(-1, max_int, max_int) - .5, zdir='y')
+
+            ax.set_xlabel("Energy [eV]", labelpad=30)
+            ax.set_xlim3d(xs.min(), xs.max())
+
+            if on == "a":
+                ax.set_zlabel("Absorption cross section [Mbarn]", labelpad=75)
+            else:
+                ax.set_zlabel("Absorption", labelpad=75)
+            ax.set_zlim3d(0, y_max)
+
+            ax.set_ylabel(r"IR Intensity $W/cm^2$", labelpad=90)
+            ax.set_ylim3d(0, max_int)
+            yticks = np.linspace(0, max_int, 5).astype(int)
+            yticklabels = self.i_w_cm_2[yticks]
+            ax.set_yticks(yticks)
+            ax.set_yticklabels(["{:02.02e}".format(x) for x in yticklabels])
+
+            ax.view_init(elev=47, azim=-90.1)
+
+            if plot_energy_levels:
+                harm_13 = self.calc_harmonic(13)
+                harm_15 = self.calc_harmonic(15)
+                ax.plot([harm_13] * 2, [-.5, 19.5], [0] * 2, color="tab:red", linestyle="-",
+                        label="13th Harmonic ({:02.02f} eV)".format(harm_13))
+                ax.plot([harm_15] * 2, [-.5, 19.5], [0] * 2, color="tab:blue", linestyle="-",
+                        label="15th Harmonic ({:02.02f} eV)".format(harm_15))
+                ax.plot([20.61577498] * 2, [-.5, 19.5], [0] * 2, color="black", linestyle="--",
+                        label="1s2s (20.62 eV)")
+                ax.plot([21.218022851325713] * 2, [-.5, 19.5], [0] * 2, color="tab:green", linestyle="--",
+                        label="1s2p (21.22 eV)")
+                ax.plot([22.9203175] * 2, [-.5, 19.5], [0] * 2, color="black", linestyle="--",
+                        label="1s3s (22.92 eV)")
+                ax.plot([23.07407494] * 2, [-.5, 19.5], [0] * 2, color="black", linestyle="--",
+                        label="1s3d (23.07 eV)")
+                ax.plot([23.087018663345155] * 2, [-.5, 19.5], [0] * 2, color="tab:green", linestyle="--",
+                        label="1s3p (23.09 eV)")
+                ax.plot([23.742070185580754] * 2, [-.5, 19.5], [0] * 2, color="tab:green", linestyle="--",
+                        label="1s4p (23.74 eV)")
+
+            ax.tick_params(axis='y', which='major', pad=40)
+            ax.tick_params(axis='z', which='major', pad=30)
+            ax.tick_params(axis='x', which='major', pad=10)
+            ax.legend()
+            fig.tight_layout()
+
+            if printing:
+                fig.savefig(os.path.join(self.save_folder,
+                                         "{}_{}_{:02.02e}_intensity_waterfall.pdf".format(on,
+                                                                                          self.lam,
+                                                                                          self.i_w_cm_2[-1])),
+                            dpi=300)
+                plt.close(fig)
+            else:
+                return fig
+
+    def get_single_rad(self, x, energy_ev, r, ir_idx):
+        energy_nm = self.ev_to_nm(energy_ev)
+        mu = np.cos(x * np.pi / 180)
+        scaling_factor = 2.1792037974346345  # make it comparable to Metzler
+        idx_n = sum(self.interp_grid_ev < energy_ev)
+        m_ = (self.n_interp.real[ir_idx][idx_n] - 1j * self.n_interp.imag[ir_idx][idx_n])
+        size_param = (2 * np.pi * r) / energy_nm
+        return mp.i_per(m_, size_param, mu) * scaling_factor

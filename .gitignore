@@ -3,6 +3,29 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Custom
+.idea/
+data/
+delta_over_beta_scans/
+dipole_response_movie/
+dipole_response_plots/
+matlab_scripts_rostock/
+mie_movies/
+old/
+build_mie_scans_delta_over_beta.py
+build_mie_scans_radius_over_energy.py
+mie_movie.py
+plot_dipole_response.py
+plot_mie_scans_delta_over_beta.py
+plot_mie_scans_radius_over_energy.py
+selected_delta_beta_radius_plots.py
+scattering_selector_R_E.py
+old/scattering_selector_R_d.py
+scattering_selector_R_d.py
+scattering_selector_R_b.py
+build_mie_scan_radius_over_beta.py
+build_mie_scan_radius_over_delta.py
+
 # C extensions
 *.so
 
